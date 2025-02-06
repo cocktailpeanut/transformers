@@ -885,7 +885,7 @@ class GenerationMixin:
         # instantiate processors list
         processors = LogitsProcessorList()
 
-        if generation_config.guidance_scale is not None and generation_config.guidance_scale != 1 and False: # : 
+        if generation_config.guidance_scale is not None and generation_config.guidance_scale != 1 and False:  
             processors.append(
                 UnbatchedClassifierFreeGuidanceLogitsProcessor(
                     generation_config.guidance_scale,
@@ -1379,12 +1379,12 @@ class GenerationMixin:
             # allow assistant_encoder_outputs to be passed if we're doing assisted generating
             if "assistant_encoder_outputs" in model_kwargs:
                 model_args |= {"assistant_encoder_outputs"}
-
+            
         for key, value in model_kwargs.items():
             if value is not None and key not in model_args:
                 unused_model_args.append(key)
 
-        if unused_model_args:
+        if unused_model_args and False:
             raise ValueError(
                 f"The following `model_kwargs` are not used by the model: {unused_model_args} (note: typos in the"
                 " generate arguments will also show up in this list)"
@@ -3248,49 +3248,107 @@ class GenerationMixin:
 
         unconditional_guidance = getattr(self,"_guidance_scale", 0 )
 
-        # unconditional_guidance = 0
-        if unconditional_guidance > 0:
+        if unconditional_guidance > 0 and unconditional_guidance != 1:
             unconditional_past_key_values = DynamicCache()
             unconditional_cache_position =  torch.ones_like(input_ids[0, -1:], dtype=torch.int64).cumsum(0) - 1
+        else:
+            unconditional_guidance = 0
+        session_cache = model_kwargs.pop("session_cache", None)
+
+        ####### Plan 9 from Deep Outer Space by DeepBeepMeep: X4 faster generation #######
+        plan9 =  self.config._attn_implementation == "flash_attention_2" 
+        if plan9:
+            prompt_length = input_ids.shape[1]
+            model_inputs = {}
+            input_pos = prompt_length - 1
+            if session_cache != None:
+                real_max_length = session_cache["real_max_length"]             
+            else:
+                real_max_length = max_length
+
+            if unconditional_guidance > 0:
+                if batch_size !=1:
+                    raise Exception("Conditional guidance only supported for the moment for batch size = 1")          
+                expanded_input_ids = torch.zeros( (2, real_max_length ), dtype= input_ids.dtype, device =input_ids.device )
+                expanded_input_ids[0, :prompt_length] = input_ids
+                expanded_input_ids[1, prompt_length -1 : prompt_length] = input_ids[0, -1:]
+                input_ids = expanded_input_ids
+            else:
+                input_ids =  torch.cat( [input_ids, torch.zeros( (batch_size, real_max_length -prompt_length ), dtype= input_ids.dtype, device =input_ids.device) ], 1 )
+
+            if session_cache != None and "position_ids" in session_cache  :
+                position_ids = session_cache["position_ids"] 
+                start_positions = session_cache["start_positions"] 
+                seq_lengths = session_cache["seq_lengths"]
+                start_length = session_cache["input_pos"] 
+                kv_cache = session_cache["kv_cache"]
+            else:
+                kv_cache = {}                
+                start_length = 0
+                if unconditional_guidance > 0:
+                    position_ids = torch.zeros(2,max_length, dtype=torch.int32, device=input_ids.device)
+                    position_ids[0] = torch.arange(0, max_length, dtype=torch.int32, device=input_ids.device)
+                    position_ids[1, prompt_length-1:] = position_ids[0, : real_max_length -prompt_length + 1] 
+                    start_positions = torch.tensor( [0 , prompt_length -1 ], dtype = position_ids.dtype, device= position_ids.device)
+                    seq_lengths = torch.tensor( [0, prompt_length -1], dtype = position_ids.dtype, device= position_ids.device)
+                else:
+                    position_ids = torch.empty(batch_size,real_max_length, dtype=torch.int32, device=input_ids.device)
+                    position_ids[:] = torch.arange(0, real_max_length, dtype=torch.int32, device=input_ids.device)
+                    start_positions = torch.zeros(batch_size , dtype = position_ids.dtype, device= position_ids.device)
+                    seq_lengths = torch.zeros( batch_size, dtype = position_ids.dtype, device= position_ids.device)
 
 
-        prompt_length = input_ids.shape[1]
-        # expanded_input_ids = torch.empty( (2, prompt_length ), dtype= input_ids.dtype, device =input_ids.device )
-        # expanded_input_ids[0] = input_ids
-        # expanded_input_ids[1] = 0
-        # expanded_input_ids[1, -1:] = input_ids[0, -1:]
-        # input_ids = expanded_input_ids 
+                # seq_lengths = seq_lengths[0:1]
+                # start_positions = start_positions[0:1]
+                # input_ids = input_ids[0:1]
+                # position_ids = position_ids[0:1]
+
+            model_inputs["position_ids"] = position_ids
+            model_inputs["input_ids"] = input_ids
+            model_inputs["start_positions"] = start_positions
+            model_inputs["seq_lengths"] = seq_lengths
+            model_inputs["real_max_length"] = real_max_length            
+            model_inputs["input_pos"] = input_pos
+            model_inputs["kv_cache"] = kv_cache
+            model_inputs["any_guidance"] = unconditional_guidance > 0
+            model_inputs["plan9"] =  True
 
         ###########################
         while self._has_unfinished_sequences(
             this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length
         ):
-            # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            model_inputs["prompt_length"] = prompt_length
-            model_inputs["unconditional_guidance"] = unconditional_guidance
-            if unconditional_guidance > 0:
+            if plan9:
+                if is_prefill:
+                    truncated_position_ids =  position_ids[:, start_length:prompt_length ]
+                    truncated_input_ids = input_ids[:, start_length:prompt_length ]
+                else:
+                    truncated_position_ids =  position_ids[:, input_pos:input_pos+1 ]
+                    truncated_input_ids = input_ids[:,  input_pos:input_pos+1 ]
+                model_inputs["position_ids"] = truncated_position_ids
+                model_inputs["input_ids"] = truncated_input_ids
+            else:
+                # prepare model inputs
+                model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
                 model_inputs["unconditional_guidance"] = unconditional_guidance
-                model_inputs["unconditional_past_key_values"] = unconditional_past_key_values
-                model_inputs["unconditional_cache_position"] = unconditional_cache_position
+                if unconditional_guidance > 0:
+                    model_inputs["unconditional_guidance"] = unconditional_guidance
+                    model_inputs["unconditional_past_key_values"] = unconditional_past_key_values
+                    model_inputs["unconditional_cache_position"] = unconditional_cache_position
 
-
-                
-
-            # prepare variable output controls (note: some models won't accept all output controls)
-            model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
-            model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+                # prepare variable output controls (note: some models won't accept all output controls)
+                model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
+                model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
 
             if is_prefill:
                 outputs = self(**model_inputs, return_dict=True)
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
                 is_prefill = False
             else:
                 i +=1
                 outputs = model_forward(**model_inputs, return_dict=True)
                 if i % 100 == 0:
                     pass
-                    # print(f"Token:{i}")
+                    print(f"Tokens: {i} out of {max_length-prompt_length}")
 
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
@@ -3303,21 +3361,36 @@ class GenerationMixin:
             if synced_gpus and this_peer_finished:
                 continue
 
-            # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
-            # (the clone itself is always small)
-            next_token_logits = outputs.logits[:, -1, :].clone().float()
-            next_token_logits = next_token_logits.to(input_ids.device)
 
             # pre-process distribution
             #####################
-            if unconditional_guidance > 0:
-                scores = torch.nn.functional.log_softmax(next_token_logits, dim=-1)                
-                unconditional_logits = outputs["unconditional_logits"]
-                unconditional_scores = torch.nn.functional.log_softmax(unconditional_logits[:, -1], dim=-1)
-                next_token_scores = unconditional_guidance * (scores - unconditional_scores) + unconditional_scores                
-                next_token_scores = logits_processor(input_ids, next_token_scores)
+            if plan9:
+                outputs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
+                if unconditional_guidance > 0:
+                    scores = outputs[0, -1:] 
+                    unconditional_scores = outputs[1, -1:] 
+                    next_token_scores = unconditional_guidance * (scores - unconditional_scores) + unconditional_scores                
+                    ref_inputs_ids = input_ids[0:1, : input_pos +1]
+                    del scores, unconditional_scores
+                else:
+                    next_token_scores = outputs[:, -1, :]
+                    ref_inputs_ids = input_ids[:, : input_pos +1]
+                next_token_scores = logits_processor(ref_inputs_ids, next_token_scores)
             else:
-                next_token_scores = logits_processor(input_ids, next_token_logits)
+                # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
+                # (the clone itself is always small)
+                next_token_logits = outputs.logits[:, -1, :].clone().float()
+                next_token_logits = next_token_logits.to(input_ids.device)
+                
+                if unconditional_guidance > 0:
+                    scores = torch.nn.functional.log_softmax(next_token_logits, dim=-1)                
+                    unconditional_logits = outputs["unconditional_logits"]
+                    unconditional_scores = torch.nn.functional.log_softmax(unconditional_logits[:, -1], dim=-1)
+                    next_token_scores = unconditional_guidance * (scores - unconditional_scores) + unconditional_scores                
+                    next_token_scores = logits_processor(input_ids, next_token_scores)
+                else:
+                    next_token_scores = logits_processor(input_ids, next_token_logits)
+
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
@@ -3346,17 +3419,34 @@ class GenerationMixin:
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
-
+            del next_token_scores
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
+
+            # print(f" P9 {plan9}, {cur_len} / {max_length}: {next_tokens} ")
+
             # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if plan9:
+                input_pos += 1
+                # print(f"new input pos:{input_pos}")
+                input_ids[:, input_pos: input_pos + 1] = next_tokens[:, None]
+                seq_lengths = torch.full_like(seq_lengths ,  input_pos)                
+                model_inputs["seq_lengths"] = seq_lengths
+                model_inputs["input_pos"] = input_pos 
+                if unconditional_guidance > 0:
+                    output_ids = input_ids[0:1, :input_pos + 1]
+                else:
+                    output_ids = input_ids[:, :input_pos + 1]
+
+                unfinished_sequences = unfinished_sequences & ~stopping_criteria(output_ids, outputs)
+            else:
+                input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+                unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
-
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+            
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
 
@@ -3390,7 +3480,17 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            if plan9:
+                if session_cache !=None:
+                    session_cache["position_ids"]  = position_ids  
+                    session_cache["start_positions"]  = start_positions
+                    session_cache["seq_lengths"] = seq_lengths
+                    session_cache["real_max_length"] = real_max_length             
+                    session_cache["input_pos"] = input_pos
+                    session_cache["kv_cache"] = kv_cache 
+                return output_ids
+            else:
+                return input_ids
 
     def _temporary_reorder_cache(self, past_key_values, beam_idx):
         """

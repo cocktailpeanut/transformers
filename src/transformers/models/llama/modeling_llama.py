@@ -50,6 +50,16 @@ from ...utils import (
 from .configuration_llama import LlamaConfig
 
 
+try:
+    import flash_attn
+    from flash_attn.flash_attn_interface import _flash_attn_forward
+    from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+except ImportError:
+    flash_attn = None
+    flash_attn_varlen_func = None
+    _flash_attn_forward = None
+
+
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
@@ -260,41 +270,97 @@ class LlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        plan9 = kwargs.get("plan9", False)
+
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)        
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+        if plan9:
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+            start_positions = kwargs["start_positions"] 
+            seq_lengths = kwargs["seq_lengths"]
+            kv_cache = kwargs["kv_cache"]
+            k_cache =  kv_cache["k_list"][self.layer_idx]
+            v_cache =  kv_cache["v_list"][self.layer_idx]
+            any_guidance = kwargs["any_guidance"]
+
+            if query_states.shape[1] == 1 or not any_guidance:
+                attn_output = flash_attn_with_kvcache(
+                    q= query_states,
+                    k_cache= k_cache,
+                    v_cache= v_cache,
+                    k= key_states,
+                    v= value_states,
+                    cache_seqlens= seq_lengths,
+                    cache_leftpad= start_positions,
+                    causal= True,
                 )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+            else:
+                attn0 = flash_attn_with_kvcache(
+                    q= query_states[0: 1],
+                    k_cache= k_cache[0: 1],
+                    v_cache= v_cache[0: 1],
+                    k= key_states[0: 1],
+                    v= value_states[0: 1],
+                    cache_seqlens= seq_lengths[0: 1],
+                    cache_leftpad= start_positions[0: 1],
+                    causal= True,
+                )
+
+                attn1 = flash_attn_with_kvcache(
+                    q= query_states[1: 2, -1:, ... ],
+                    k_cache= k_cache[1: 2],
+                    v_cache= v_cache[1: 2],
+                    k= key_states[1: 2, -1:, ... ],
+                    v= value_states[1: 2, -1:, ... ],
+                    cache_seqlens= seq_lengths[1: 2],
+                    cache_leftpad= start_positions[1: 2],
+                    causal= True,
+                )
+                attn1ext = torch.zeros_like(attn0)
+                attn1ext[:, -1:, ...] = attn1
+                attn_output = torch.cat([attn0, attn1ext], 0)
+            attn_weights = None
+        else:
+            if past_key_value is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                    logger.warning_once(
+                        "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                        'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                    )
+                else:
+                    attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -326,7 +392,8 @@ class LlamaDecoderLayer(nn.Module):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states) 
+
         # return (hidden_states,)
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
@@ -536,57 +603,69 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        plan9 =flash_attn_kwargs.get("plan9", False)
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
-            use_cache = False
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+        if not plan9:
+            if self.gradient_checkpointing and self.training and use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+                )
+                use_cache = False
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            if use_cache and past_key_values is None:
+                past_key_values = DynamicCache()
+
+            if cache_position is None:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                cache_position = torch.arange(
+                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+
+
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
+
+
+            hidden_states = inputs_embeds
+
+            # create position embeddings to be shared across the decoder layers
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
             )
 
+            if unconditional_guidance > 0 :
+                unconditional_hidden_states = hidden_states[:, -1:, :]
+                past_seen_tokens = unconditional_past_key_values.get_seq_length() if unconditional_past_key_values is not None else 0
+                unconditional_position_ids = torch.full( (inputs_embeds.shape[0],1) , past_seen_tokens, dtype= torch.int64, device=inputs_embeds.device )
+                unconditional_position_embeddings = self.rotary_emb(unconditional_hidden_states, unconditional_position_ids)
 
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-
-
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
-        seq_length = inputs_embeds.shape[1]
-
-
-        # sub_mask = nn.Transformer.generate_square_subsequent_mask(seq_length, dtype= inputs_embeds.dtype, device =inputs_embeds.device ).unsqueeze(0)
-
-        # expanded_mask = torch.empty( (2, seq_length, seq_length ), dtype= inputs_embeds.dtype, device =inputs_embeds.device )
-        # expanded_mask[0] = sub_mask
-        # sub_mask[:,  : prompt_length-1, : prompt_length-1 ] = sub_mask.dtype.i
-        # expanded_mask[1] = sub_mask
+        else:
+            kwargs = flash_attn_kwargs
+            hidden_states = inputs_embeds
+            position_embeddings =  self.rotary_emb(hidden_states, position_ids)
+            causal_mask = None
+            kv_cache =  kwargs["kv_cache"]
+            if len(kv_cache) == 0:
+                real_max_length = kwargs["real_max_length"]
+                v_list = []
+                k_list = []
+                head_dim = self.config.head_dim
+                num_key_value_heads = self.config.num_key_value_heads
+                for _ in range(self.config.num_hidden_layers): #self.config.head_dim
+                    k_list.append( torch.zeros(hidden_states.shape[0], real_max_length, num_key_value_heads ,
+                                                head_dim , dtype= hidden_states.dtype, device= hidden_states.device ) ) 
+                    v_list.append( torch.zeros(hidden_states.shape[0], real_max_length, num_key_value_heads ,
+                                            head_dim , dtype= hidden_states.dtype, device= hidden_states.device ) ) 
+                kv_cache["k_list"] = k_list
+                kv_cache["v_list"] = v_list
         
-        
-        hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        if unconditional_guidance > 0 :
-            unconditional_hidden_states = hidden_states[:, -1:, :]
-            past_seen_tokens = unconditional_past_key_values.get_seq_length() if unconditional_past_key_values is not None else 0
-            unconditional_position_ids = torch.full( (inputs_embeds.shape[0],1) , past_seen_tokens, dtype= torch.int64, device=inputs_embeds.device )
-            unconditional_position_embeddings = self.rotary_emb(unconditional_hidden_states, unconditional_position_ids)
 
 
         # decoder layers
