@@ -2135,7 +2135,7 @@ class GenerationMixin:
                 "`streamer` cannot be used with beam search (yet!). Make sure that `num_beams` is set to 1."
             )
 
-        if not is_torchdynamo_compiling() and self.device.type != input_ids.device.type:
+        if not is_torchdynamo_compiling() and self.device.type != input_ids.device.type and False:
             warnings.warn(
                 "You are calling .generate() with the `input_ids` being on a device type different"
                 f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model"
@@ -3243,22 +3243,27 @@ class GenerationMixin:
 
         is_prefill = True
         i = 0
-        unconditional_cache_position = 0
-        unconditional_past_key_values = None
 
         unconditional_guidance = getattr(self,"_guidance_scale", 0 )
 
-        if unconditional_guidance > 0 and unconditional_guidance != 1:
-            unconditional_past_key_values = DynamicCache()
-            unconditional_cache_position =  torch.ones_like(input_ids[0, -1:], dtype=torch.int64).cumsum(0) - 1
-        else:
-            unconditional_guidance = 0
-        session_cache = model_kwargs.pop("session_cache", None)
-
         ####### Plan 9 from Deep Outer Space by DeepBeepMeep: X4 faster generation #######
         plan9 =  self.config._attn_implementation == "flash_attention_2" 
+
+        unconditional_cache_position = 0
+        unconditional_past_key_values = None
+
+        if unconditional_guidance == 1:
+            unconditional_guidance = 0
+
+        if unconditional_guidance > 0 and not plan9:
+            unconditional_past_key_values = DynamicCache()
+            unconditional_cache_position =  torch.ones_like(input_ids[0, -1:], dtype=torch.int64).cumsum(0) - 1
+
+        session_cache = model_kwargs.pop("session_cache", None)
+        callback = model_kwargs.pop("callback", None)
+
+        prompt_length = input_ids.shape[1]
         if plan9:
-            prompt_length = input_ids.shape[1]
             model_inputs = {}
             input_pos = prompt_length - 1
             if session_cache != None:
@@ -3344,11 +3349,12 @@ class GenerationMixin:
                 # torch.cuda.empty_cache()
                 is_prefill = False
             else:
-                i +=1
                 outputs = model_forward(**model_inputs, return_dict=True)
                 if i % 100 == 0:
-                    pass
-                    print(f"Tokens: {i} out of {max_length-prompt_length}")
+                    if callback !=None:
+                        callback(i, max_length-prompt_length)                
+                        # print(f"Tokens: {i} out of {max_length-prompt_length}")
+                i +=1
 
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
